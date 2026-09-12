@@ -23,4 +23,8 @@ The raw engine result is `docs/results/aws-engine-validation.json`. It explicitl
 
 No AWS credentials were available. CloudFormation deployment, EMR startup, Glue permissions, S3 execution-role access and GitHub-to-AWS OIDC remain account-level integration checks. Local tests do not establish those results.
 
-The connected GitHub app returned 404 for the private repository. The authoring session did not push this AWS revision or execute its workflows on GitHub. The downloadable release includes everything needed to upload and run it.
+The public repository is https://github.com/maabbasa/lakehouse-pr-aws-previews. GitHub Actions run 34713817118 passed infrastructure validation, all 9 AWS unit tests and five real Spark/Iceberg integration scenarios. It did not deploy to AWS.
+
+## Repository exposure review
+
+Gitleaks 8.30.1 scanned both published commits through 24b46c74d66ff7d5254ca6a06ce1b2922e9e201b and the working tree on 2026-09-12. No secrets were detected. This scan covers the Git history available from the repository; it does not certify an AWS account or detect every possible secret format.

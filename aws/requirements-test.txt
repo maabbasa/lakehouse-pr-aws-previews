@@ -1,4 +1,0 @@
--r requirements.txt
-pytest>=8,<9
-cfn-lint>=1.40,<2
-pyspark==3.5.6

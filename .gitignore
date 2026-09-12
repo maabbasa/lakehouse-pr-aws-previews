@@ -3,3 +3,13 @@ __pycache__/
 .pytest_cache/
 artifacts/
 .DS_Store
+
+# Local credentials and private keys
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+id_rsa
+id_ed25519

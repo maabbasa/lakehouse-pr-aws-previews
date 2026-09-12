@@ -69,7 +69,7 @@ spark.sql(f&quot;&quot;&quot;
 <p>Both results remain queryable long enough for the job to compare them. The job records the output table&#39;s main snapshot before and after the preview and fails its check if that snapshot changes. This is a useful assertion in the isolated sandbox. In a system with concurrent production writers, a changed main snapshot would need a more careful explanation than simply blaming the preview.</p>
 <p>Branches operate at table level, and a table&#39;s schema is shared across its branches. This example is for transformation changes with a stable output schema. It is not a safe way to trial arbitrary schema migrations against a production table.</p>
 <h2>Run the example in an AWS sandbox</h2>
-<p>The package includes the infrastructure template, Spark job, runner, SQL files, workflows and integration tests. Download it from <strong>[GitHub repository link]</strong>.</p>
+<p>The package includes the infrastructure template, Spark job, runner, SQL files, workflows and integration tests. Download it from <a href="https://github.com/maabbasa/lakehouse-pr-aws-previews">the GitHub repository</a>.</p>
 <p>Authenticate the AWS CLI to your sandbox account and choose a Region that supports the selected EMR release. You will also need Python 3.11 or newer and permissions to deploy the resources in the template. The setup guide covers existing GitHub OIDC providers and accounts that use Lake Formation permissions.</p>
 <p>From the repository directory:</p>
 <pre><code class="language-bash">python3 -m venv .venv

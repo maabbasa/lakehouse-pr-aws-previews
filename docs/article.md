@@ -117,7 +117,7 @@ Branches operate at table level, and a table's schema is shared across its branc
 
 ## Run the example in an AWS sandbox
 
-The package includes the infrastructure template, Spark job, runner, SQL files, workflows and integration tests. Download it from **[GitHub repository link]**.
+The package includes the infrastructure template, Spark job, runner, SQL files, workflows and integration tests. Download it from [the GitHub repository](https://github.com/maabbasa/lakehouse-pr-aws-previews).
 
 Authenticate the AWS CLI to your sandbox account and choose a Region that supports the selected EMR release. You will also need Python 3.11 or newer and permissions to deploy the resources in the template. The setup guide covers existing GitHub OIDC providers and accounts that use Lake Formation permissions.
 
