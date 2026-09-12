@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EMR Serverless Iceberg pull-request previews in an isolated AWS sandbox
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: maabbasa/lakehouse-pr-previews
+    AllowedPattern: '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+  GitHubEnvironment:
+    Type: String
+    Default: aws-preview
+    AllowedPattern: '[a-zA-Z0-9_-]+'
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ''
+    Description: Existing token.actions.githubusercontent.com IAM OIDC provider ARN, if present
+  DatabaseName:
+    Type: String
+    Default: pr_preview_lab
+    AllowedPattern: '[a-z][a-z0-9_]{0,62}'
+Conditions:
+  CreateOidc: !Equals [!Ref ExistingOidcProviderArn, '']
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Reports
+            Status: Enabled
+            Prefix: reports/
+            ExpirationInDays: 30
+          - Id: Logs
+            Status: Enabled
+            Prefix: logs/
+            ExpirationInDays: 14
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt Bucket.Arn, !Sub '${Bucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  Database:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: {Name: !Ref DatabaseName, Description: "Dedicated preview sandbox, never production"}
+  Application:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      Name: !Sub '${AWS::StackName}-spark'
+      Type: SPARK
+      ReleaseLabel: emr-7.12.0
+      Architecture: X86_64
+      AutoStartConfiguration: {Enabled: true}
+      AutoStopConfiguration: {Enabled: true, IdleTimeoutMinutes: 5}
+      MaximumCapacity: {Cpu: '8 vCPU', Memory: '32 GB'}
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: emr-serverless.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref AWS::AccountId}
+              ArnLike: {'aws:SourceArn': !GetAtt Application.Arn}
+      Policies:
+        - PolicyName: SandboxData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt Bucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub '${Bucket.Arn}/assets/*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload]
+                Resource: [!Sub '${Bucket.Arn}/warehouse/*', !Sub '${Bucket.Arn}/reports/*', !Sub '${Bucket.Arn}/logs/*']
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetTables, glue:CreateTable, glue:UpdateTable]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*'
+  Oidc:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+  GitHubRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateOidc, !Ref Oidc, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubRepository}:environment:${GitHubEnvironment}'
+      Policies:
+        - PolicyName: SubmitPreview
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt Bucket.Arn
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: [!Sub '${Bucket.Arn}/assets/*', !Sub '${Bucket.Arn}/reports/*']
+              - Effect: Allow
+                Action: [emr-serverless:StartJobRun, emr-serverless:GetApplication]
+                Resource: !GetAtt Application.Arn
+              - Effect: Allow
+                Action: [emr-serverless:GetJobRun, emr-serverless:CancelJobRun]
+                Resource: !Sub '${Application.Arn}/jobruns/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt ExecutionRole.Arn
+                Condition: {StringEquals: {'iam:PassedToService': emr-serverless.amazonaws.com}}
+Outputs:
+  BucketName: {Value: !Ref Bucket}
+  ApplicationId: {Value: !Ref Application}
+  ExecutionRoleArn: {Value: !GetAtt ExecutionRole.Arn}
+  GitHubRoleArn: {Value: !GetAtt GitHubRole.Arn}
+  DatabaseName: {Value: !Ref DatabaseName}

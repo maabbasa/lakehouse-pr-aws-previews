@@ -1,0 +1,156 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stop creating table_test: preview your EMR output before you merge</title><style>body{margin:0;color:#1e1e1e;background:#fafbfc;font:18px/1.7 Arial,sans-serif}main{max-width:850px;padding:48px 28px;margin:auto;background:white}h1{font-size:48px;line-height:1.12;margin:18px 0 30px}h2{font-size:30px;line-height:1.25;margin-top:50px}a{color:#113af5}img{max-width:100%;height:auto}pre{background:#f2f5f8;padding:20px;overflow:auto;font-size:14px;line-height:1.6}code{font-family:monospace}table{font-size:15px;border-collapse:collapse;width:100%;display:block;overflow:auto}th,td{padding:10px;border-bottom:1px solid #d9d9d9;text-align:left}strong{font-weight:700}.draft{font-size:13px;letter-spacing:.12em;color:#52677b}hr{border:0;border-top:1px solid #ddd;margin:40px 0}</style><main><p class="draft">BUILD WITH ABBAS</p><h1>Stop creating table_test: preview your EMR output before you merge</h1><p><img src="assets/aws-cover.jpg" alt="Preview your data before production with EMR Serverless, Iceberg and AWS Glue"></p>
+<p>Have you ever changed a Glue or EMR job and wondered what the output would actually look like once it reached production?</p>
+<p>The code review looks reasonable. The tests pass. But the change touches a join, a filter or a calculation, and you still want to see the resulting data before you approve it.</p>
+<p>So you write to <code>orders_test</code>. Someone else needs their own version, which becomes <code>orders_test_v2</code>. A week later, the catalog contains <code>orders_test_final</code>, and nobody is quite sure which code produced it or whether its input matches today&#39;s data.</p>
+<p>Those tables started with a sensible goal: give the change somewhere to run. The missing piece is a repeatable way to connect the code being reviewed, the input it read and the output it produced.</p>
+<p>I wanted a pull request to answer a more useful question: <strong>if both versions of this transformation read the same input, what changes in the result?</strong></p>
+<p>This walkthrough builds that preview around Amazon EMR Serverless, the AWS Glue Data Catalog and Apache Iceberg tables in S3. A run captures input snapshot IDs, executes the base and candidate SQL, and writes each result to its own Iceberg branch. The reviewer gets a comparison before merging the code.</p>
+<p>The example uses EMR Serverless as its execution engine. AWS Glue provides the catalog; this is not a wrapper that automatically executes an existing Glue ETL job.</p>
+<h2>A small code change with a visible consequence</h2>
+<p>Consider an order summary grouped by customer region. The existing transformation counts every order:</p>
+<pre><code class="language-sql">SELECT c.region,
+       count(*) AS orders,
+       sum(o.amount_cents) AS revenue_cents
+FROM input_orders o
+JOIN input_customers c
+  ON o.customer_id = c.customer_id
+GROUP BY c.region
+</code></pre>
+<p>The proposed change excludes cancelled orders:</p>
+<pre><code class="language-sql">WHERE o.status = &#39;COMPLETE&#39;
+</code></pre>
+<p>That line is easy to review in GitHub. Its effect is harder to judge from the diff alone. How many orders disappear? Which regions change? Does the join still produce the expected groups?</p>
+<p>A preview should make those consequences visible. It should also keep yesterday&#39;s input and today&#39;s input from getting mixed into the comparison.</p>
+<p>The sample dataset has 10,000 orders and 100 customers. Exactly 1,000 orders are cancelled. Amounts are stored as integer cents so the comparison does not depend on floating-point rounding.</p>
+<h2>The AWS architecture</h2>
+<p><img src="assets/aws-architecture.png" alt="AWS architecture: GitHub Actions submits an EMR Serverless preview using Glue Iceberg metadata and data in S3"></p>
+<p>GitHub Actions submits the work through the EMR Serverless API. The runner receives temporary AWS credentials through OpenID Connect, then uploads the job and SQL files to a location named for that run.</p>
+<p>EMR starts Spark with the Iceberg runtime supplied by the release. Spark uses the Glue catalog to resolve table metadata and reads or writes the underlying files through S3. The comparison happens inside the same Spark job, so this example does not need a separate query service.</p>
+<p>The CloudFormation template creates a dedicated sandbox bucket, Glue database, EMR application and IAM roles. The execution role can access that sandbox&#39;s data and catalog entries. It has no permissions to your existing production tables through this template.</p>
+<p>I chose EMR Serverless 7.12.0 for the package. AWS lists Spark 3.5.6 and Iceberg 1.10.0 for that release. Keeping the supplied Iceberg runtime avoids mixing an independently downloaded runtime into the EMR classpath. <a href="https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-7120-release.html">EMR release details</a>.</p>
+<p>The job uses this catalog configuration:</p>
+<pre><code class="language-text">spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+spark.sql.catalog.lake=org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.lake.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
+spark.sql.catalog.lake.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+</code></pre>
+<p>The runner adds the warehouse location from the stack&#39;s bucket output and loads <code>/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar</code>. Credentials come from the EMR execution role. <a href="https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/using-iceberg.html">AWS configuration guide</a>.</p>
+<h2>Keep the input still while the code changes</h2>
+<p>Comparing a candidate with the current output table is not always a fair test. That output might have been produced hours earlier, before new orders arrived or customer records changed.</p>
+<p>Instead, the job reads the current snapshot ID of each input table and saves those IDs in a run manifest. Both transformations then read the same versions through temporary Spark views:</p>
+<pre><code class="language-python">spark.sql(f&quot;&quot;&quot;
+    CREATE OR REPLACE TEMP VIEW input_orders AS
+    SELECT * FROM lake.pr_preview_lab.orders
+    VERSION AS OF {orders_snapshot_id}
+&quot;&quot;&quot;)
+</code></pre>
+<p>The customers view follows the same pattern. The SQL files refer to <code>input_orders</code> and <code>input_customers</code>, which gives the preview runner control over the input versions without changing the transformation itself.</p>
+<p>The job also creates temporary tags for the captured input snapshots. These references keep the snapshots reachable during the preview&#39;s retention window. Recording a snapshot ID alone would not protect it from a maintenance process that expires unreferenced snapshots.</p>
+<p>There is a limit here that matters for joins: the orders and customers snapshot IDs are captured separately. Iceberg does not turn that pair into an atomic snapshot of the whole database. If your pipeline requires both tables to represent exactly the same ingestion batch, supply a manifest from that completed batch instead of independently selecting each table&#39;s latest snapshot.</p>
+<h2>Give each output its own branch</h2>
+<p>Iceberg branches let a table retain separate snapshot histories. Creating a branch references an existing snapshot; the transformation writes new data files when it produces its result. <a href="https://iceberg.apache.org/docs/latest/spark-writes/">Iceberg branch writes</a>.</p>
+<p>For each preview, the job creates two branches on <code>order_totals</code>: one for the base transformation and one for the candidate. A branch name includes the pull request number, commit prefix and run attempt so a rerun gets its own references.</p>
+<p>The write is explicitly directed at the branch:</p>
+<pre><code class="language-python">spark.sql(f&quot;&quot;&quot;
+    ALTER TABLE lake.pr_preview_lab.order_totals
+    CREATE BRANCH {branch}
+    AS OF VERSION {output_snapshot_id}
+    RETAIN 1 DAYS
+&quot;&quot;&quot;)
+
+spark.sql(f&quot;&quot;&quot;
+    INSERT OVERWRITE
+    lake.pr_preview_lab.order_totals.branch_{branch}
+    SELECT region, orders, revenue_cents
+    FROM proposed_output
+&quot;&quot;&quot;)
+</code></pre>
+<p>The base transformation runs again on the pinned input, even though an output already exists on the main branch. That extra run makes the comparison about the code change rather than the age of the previous output.</p>
+<p>Both results remain queryable long enough for the job to compare them. The job records the output table&#39;s main snapshot before and after the preview and fails its check if that snapshot changes. This is a useful assertion in the isolated sandbox. In a system with concurrent production writers, a changed main snapshot would need a more careful explanation than simply blaming the preview.</p>
+<p>Branches operate at table level, and a table&#39;s schema is shared across its branches. This example is for transformation changes with a stable output schema. It is not a safe way to trial arbitrary schema migrations against a production table.</p>
+<h2>Run the example in an AWS sandbox</h2>
+<p>The package includes the infrastructure template, Spark job, runner, SQL files, workflows and integration tests. Download it from <strong>[GitHub repository link]</strong>.</p>
+<p>Authenticate the AWS CLI to your sandbox account and choose a Region that supports the selected EMR release. You will also need Python 3.11 or newer and permissions to deploy the resources in the template. The setup guide covers existing GitHub OIDC providers and accounts that use Lake Formation permissions.</p>
+<p>From the repository directory:</p>
+<pre><code class="language-bash">python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r aws/requirements.txt
+
+bash aws/deploy.sh
+source artifacts/aws-env.sh
+</code></pre>
+<p>The deployment helper prints the account identity before creating the stack. It writes the stack outputs into the environment file used by the commands below.</p>
+<p>Seed the synthetic dataset once:</p>
+<pre><code class="language-bash">python aws/run.py --action seed \
+  --bucket &quot;$BUCKET&quot; --application &quot;$APP&quot; \
+  --role &quot;$ROLE&quot; --namespace &quot;$DATABASE&quot; \
+  --run pr_1_000000000001_r1
+</code></pre>
+<p>The seed job deliberately refuses to replace existing tables. Run the bundled cancellation-filter example with a fresh run identifier:</p>
+<pre><code class="language-bash">python aws/run.py \
+  --bucket &quot;$BUCKET&quot; --application &quot;$APP&quot; \
+  --role &quot;$ROLE&quot; --namespace &quot;$DATABASE&quot; \
+  --run pr_1_000000000002_r1
+</code></pre>
+<p>Under the hood, <code>aws/run.py</code> uploads the code and calls <code>start_job_run</code>. The request supplies the application ID, execution role, S3 entry point, Spark configuration and an execution timeout. It then waits for EMR to reach a terminal state and retrieves the comparison from S3.</p>
+<p>A failed Spark job fails the runner. A successful submission alone does not count as a successful preview.</p>
+<h2>What the reviewer sees</h2>
+<p>The report contains the input snapshot IDs, both outputs, per-region deltas and structural checks. The included example produces this comparison in the local Spark and Iceberg integration test:</p>
+<table>
+<thead>
+<tr>
+<th>Region</th>
+<th align="right">Orders before</th>
+<th align="right">Orders after</th>
+<th align="right">Revenue change, cents</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>EU</td>
+<td align="right">3,400</td>
+<td align="right">3,000</td>
+<td align="right">-850,000</td>
+</tr>
+<tr>
+<td>UK</td>
+<td align="right">3,300</td>
+<td align="right">3,000</td>
+<td align="right">-600,000</td>
+</tr>
+<tr>
+<td>US</td>
+<td align="right">3,300</td>
+<td align="right">3,000</td>
+<td align="right">-675,000</td>
+</tr>
+<tr>
+<td>Total</td>
+<td align="right">10,000</td>
+<td align="right">9,000</td>
+<td align="right">-2,125,000</td>
+</tr>
+</tbody></table>
+<p>The change removes the expected 1,000 orders. Revenue falls from 22,375,000 cents to 20,250,000 cents, about 9.5%. The regional breakdown gives the reviewer something more specific to investigate than a green job status.</p>
+<p>The engine test runs real Spark 3.5.6 and Iceberg 1.10.0 against a local catalog and local files. It also exercises new input arriving after snapshot capture, a failed candidate query and repeated cleanup. These results establish the behavior of the preview logic; they are not measurements from an EMR deployment or a performance benchmark.</p>
+<p>The default checks verify that the candidate is nonempty, region keys are unique, counts are nonnegative and the main output snapshot is unchanged. They do not decide whether excluding cancelled orders is the right business rule. Add the assertions your pipeline needs, such as duplicate-key checks, null limits or an expected change in a specific metric.</p>
+<h2>Attach the result to a pull request</h2>
+<p><img src="assets/aws-pipeline.png" alt="Preview lifecycle from pinned input through base and candidate writes, comparison, report creation and reference cleanup"></p>
+<p>The repository contains two workflows. <code>aws-validate.yml</code> checks the template, runs unit tests and exercises the Iceberg logic without AWS credentials. <code>aws-preview.yml</code> submits the actual AWS jobs after approval.</p>
+<p>Configure a GitHub environment named <code>aws-preview</code> with required reviewers and deployment restricted to the trusted default branch. Its variables hold the AWS Region and the stack outputs: bucket, application ID, execution role, GitHub role and Glue database. The setup guide lists their exact names.</p>
+<p>To preview a change, open a PR that modifies <code>aws/candidate.sql</code>, then dispatch the AWS workflow from the default branch with the PR number and full head commit SHA you reviewed. The workflow rejects forks and refuses to proceed if the PR head no longer matches that SHA.</p>
+<p>It reads the baseline SQL from the PR&#39;s base commit and the candidate from its head commit. The resulting comparison appears in the Actions summary, with the JSON saved as an artifact. If the transformation is unchanged, a zero delta is the expected result.</p>
+<p>This approval matters because the workflow executes code from the candidate checkout with AWS permissions. An Iceberg branch does not stop that code from issuing a write to another reference. The sandbox and IAM policy define the access boundary. Branches define where the intended output goes.</p>
+<p>There is no automatic merge of data into the main branch. Review the result, merge the code when appropriate, and deploy through your normal production process.</p>
+<h2>Clean up the preview without deleting shared data</h2>
+<p>After collecting the report, the workflow runs a separate cleanup job. It removes the run&#39;s input tags and output branches, while leaving the report available for review.</p>
+<p>For the manual example:</p>
+<pre><code class="language-bash">python aws/run.py --action cleanup \
+  --bucket &quot;$BUCKET&quot; --application &quot;$APP&quot; \
+  --role &quot;$ROLE&quot; --namespace &quot;$DATABASE&quot; \
+  --run pr_1_000000000002_r1
+</code></pre>
+<p>Cleanup accepts only the expected run-name pattern. On the same runner, it checks the saved writer job and refuses to continue while that job is active. If a GitHub runner disappears entirely, confirm that the EMR writer has stopped before dispatching cleanup with the old run name.</p>
+<p>Dropping a branch does not immediately remove its data files. Other snapshots can still reference those files, so a broad S3 delete is unsafe. Long-lived installations need Iceberg-aware snapshot expiration and orphan-file maintenance. The one-day reference retention setting is applied by maintenance; it is not an automatic cleanup timer. <a href="https://iceberg.apache.org/docs/latest/spark-ddl/">Iceberg reference lifecycle</a>.</p>
+<p>The template bounds the EMR application&#39;s capacity, sets job timeouts and allows it to stop when idle. Those controls are useful for a small preview workload, but they are not a fixed spending limit. When finished with the sandbox, delete the stack and inspect the retained S3 bucket before removing its data.</p>
+<p>The useful outcome is a pull request with evidence attached to it: the input versions, the two transformations and the difference between their outputs. When the next filter or join change arrives, the reviewer has something concrete to inspect before production becomes the first place anyone sees the result.</p>
+</main></html>

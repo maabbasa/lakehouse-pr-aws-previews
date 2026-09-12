@@ -1,0 +1,30 @@
+name: Validate AWS preview package
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: python -m pip install -r aws/requirements-test.txt
+      - run: cfn-lint aws/template.yaml
+      - run: python -m pytest tests/aws/test_core.py -q
+      - name: Real Spark and Iceberg integration
+        run: |
+          curl --fail --location --retry 3 -o /tmp/iceberg.jar https://repo.maven.apache.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.10.0/iceberg-spark-runtime-3.5_2.12-1.10.0.jar
+          ICEBERG_JAR=/tmp/iceberg.jar SPARK_LOCAL_IP=127.0.0.1 python tests/aws/integration.py
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: engine-validation
+          path: docs/results/aws-engine-validation.json

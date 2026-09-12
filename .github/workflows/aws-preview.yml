@@ -1,0 +1,105 @@
+name: AWS output preview
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Same-repository PR number (review its code before approving the environment)
+        required: true
+      expected_head:
+        description: Full 40-character PR head commit SHA that you reviewed
+        required: true
+      action:
+        description: Seed once; preview thereafter; cleanup for interrupted runs
+        type: choice
+        options: [preview, seed, cleanup]
+        default: preview
+      cleanup_run:
+        description: Exact run name for cleanup only
+        required: false
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+concurrency:
+  group: aws-preview-${{ inputs.pr }}
+  cancel-in-progress: false
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: aws-preview
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      BUCKET: ${{ vars.PREVIEW_BUCKET }}
+      APP: ${{ vars.EMR_APPLICATION_ID }}
+      ROLE: ${{ vars.EMR_EXECUTION_ROLE_ARN }}
+      DATABASE: ${{ vars.GLUE_DATABASE }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve immutable commits and reject forks
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          REPO: ${{ github.repository }}
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          [[ "$PR" =~ ^[1-9][0-9]*$ ]] || exit 1
+          gh api "repos/$REPO/pulls/$PR" > /tmp/pr.json
+          python - <<'PY'
+          import json, os
+          p=json.load(open('/tmp/pr.json'))
+          assert p['head']['repo']['full_name']==os.environ['REPO'], 'Fork code cannot use AWS credentials'
+          assert p['state']=='open' or os.environ['ACTION']=='cleanup', 'Use an open PR for execution'
+          assert p['head']['sha']==os.environ['EXPECTED_HEAD'], 'PR head changed; review the new commit'
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('head='+p['head']['sha']+'\nbase='+p['base']['sha']+'\n')
+          PY
+      - name: Fetch baseline transformation from PR base commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ steps.refs.outputs.base }}
+        run: |
+          gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/aws/candidate.sql?ref=$BASE" > /tmp/baseline.sql
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ steps.refs.outputs.head }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r aws/requirements.txt
+      - uses: aws-actions/configure-aws-credentials@v6.2.4
+        with:
+          role-to-assume: ${{ vars.AWS_PREVIEW_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 7200
+      - name: Set run identity
+        env:
+          PR: ${{ inputs.pr }}
+          SHA: ${{ steps.refs.outputs.head }}
+          CLEANUP_RUN: ${{ inputs.cleanup_run }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          RUN="pr_${PR}_${SHA:0:12}_r${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}"
+          if [ "$ACTION" = cleanup ]; then RUN="$CLEANUP_RUN"; fi
+          echo "PREVIEW_RUN=$RUN" >> "$GITHUB_ENV"
+      - name: Run EMR job
+        env:
+          ACTION: ${{ inputs.action }}
+        run: |
+          python aws/run.py --bucket "$BUCKET" --application "$APP" --role "$ROLE" --namespace "$DATABASE" --run "$PREVIEW_RUN" --action "$ACTION" --baseline /tmp/baseline.sql
+      - name: Clean preview references after the writer stops
+        if: ${{ always() && inputs.action == 'preview' && env.PREVIEW_RUN != '' }}
+        run: |
+          python aws/run.py --bucket "$BUCKET" --application "$APP" --role "$ROLE" --namespace "$DATABASE" --run "$PREVIEW_RUN" --action cleanup
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: aws-preview-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 14
