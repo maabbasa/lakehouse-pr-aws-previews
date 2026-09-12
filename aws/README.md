@@ -17,7 +17,7 @@ aws cloudformation deploy \
   --template-file aws/template.yaml \
   --stack-name iceberg-pr-preview \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides GitHubRepository=maabbasa/lakehouse-pr-aws-previews
+  --parameter-overrides GitHubRepository=maabbasa/lakehouse-pr-previews
 
 aws cloudformation describe-stacks --stack-name iceberg-pr-preview \
   --query 'Stacks[0].Outputs' --output table

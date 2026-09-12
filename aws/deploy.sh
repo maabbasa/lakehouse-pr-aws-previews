@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 STACK_NAME="${STACK_NAME:-iceberg-pr-preview}"
-REPOSITORY="${GITHUB_REPOSITORY:-maabbasa/lakehouse-pr-aws-previews}"
+REPOSITORY="${GITHUB_REPOSITORY:-maabbasa/lakehouse-pr-previews}"
 parameters=("GitHubRepository=$REPOSITORY")
 if [[ -n "${EXISTING_OIDC_PROVIDER_ARN:-}" ]]; then parameters+=("ExistingOidcProviderArn=$EXISTING_OIDC_PROVIDER_ARN"); fi
 aws sts get-caller-identity
